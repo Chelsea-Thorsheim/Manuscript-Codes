@@ -1,0 +1,291 @@
+# ============================================================
+# GSE135251 liver fibrosis RNA-seq heatmaps (publication-grade v2)
+#
+# Key upgrades:
+# - viridis preserved (cross-figure consistency)
+# - fixed z-score scaling (-2.5 to 2.5)
+# - robust row-wise normalization
+# - improved layout + typography
+# - publication-ready PDF + TIFF outputs
+#
+# Output:
+#   GSE135251_individual_heatmap_publication_v2.pdf
+#   GSE135251_individual_heatmap_publication_v2.tiff
+#   GSE135251_stage_average_heatmap_publication_v2.pdf
+#   GSE135251_stage_average_heatmap_publication_v2.tiff
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import mygene
+from matplotlib.patches import Patch
+from matplotlib.colors import TwoSlopeNorm
+
+# ============================================================
+# GLOBAL STYLE (publication-ready)
+# ============================================================
+
+mpl.rcParams.update({
+    "font.family": "Arial",
+    "font.size": 10,
+    "axes.titlesize": 12,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42
+})
+
+sns.set_theme(style="white")
+
+# ============================================================
+# Files
+# ============================================================
+
+expr_file = "GSE135251_norm_counts_TPM_GRCh38.p13_NCBI.tsv"
+meta_file = "GSE135251_series_matrix.txt"
+
+# ============================================================
+# Gene list
+# ============================================================
+
+genes = [
+    "FLCN","TFE3","CHKA","CHKB","PCYT1A",
+    "CHPT1","ETNK1","ETNK2","PCYT2",
+    "CEPT1","SELENOI","PEMT",
+    "APOB","MTTP",
+    "GPAM","GPAT4",
+    "AGPAT1","AGPAT2","AGPAT3","AGPAT4",
+    "DGAT1","DGAT2",
+    "LPIN1","LPIN2","LPIN3"
+]
+
+# ============================================================
+# Load expression matrix
+# ============================================================
+
+print("Loading TPM matrix...")
+
+expr = pd.read_csv(expr_file, sep="\t")
+expr["GeneID"] = expr["GeneID"].astype(str)
+expr = expr.set_index("GeneID")
+
+# ============================================================
+# Gene mapping
+# ============================================================
+
+print("Mapping genes...")
+
+mg = mygene.MyGeneInfo()
+
+result = mg.querymany(
+    genes,
+    scopes="symbol",
+    fields="entrezgene,symbol",
+    species="human"
+)
+
+gene_map = {}
+for r in result:
+    if "entrezgene" in r:
+        gene_map[str(r["entrezgene"])] = r["symbol"]
+
+ids_present = [x for x in gene_map if x in expr.index]
+expr = expr.loc[ids_present]
+expr.index = [gene_map[x] for x in expr.index]
+
+print("\nGenes found:")
+print(expr.index.tolist())
+
+# ============================================================
+# Parse metadata
+# ============================================================
+
+print("\nParsing metadata...")
+
+geo_ids = None
+fibrosis_info = None
+
+with open(meta_file) as f:
+    for line in f:
+
+        if line.startswith("!Sample_geo_accession"):
+            geo_ids = [x.replace('"', '') for x in line.rstrip().split("\t")[1:]]
+
+        if (
+            line.startswith("!Sample_characteristics_ch1")
+            and "fibrosis stage" in line.lower()
+        ):
+            fibrosis_info = [x.replace('"', '') for x in line.rstrip().split("\t")[1:]]
+
+meta = pd.DataFrame({
+    "sample": geo_ids,
+    "fibrosis": fibrosis_info
+})
+
+meta["stage"] = meta["fibrosis"].str.extract(r'([0-4])', expand=False)
+meta["stage"] = "F" + meta["stage"]
+
+stage_order = ["F0", "F1", "F2", "F3", "F4"]
+
+meta["stage"] = pd.Categorical(meta["stage"], categories=stage_order, ordered=True)
+meta = meta.sort_values("stage")
+
+ordered_samples = [s for s in meta["sample"] if s in expr.columns]
+expr = expr[ordered_samples]
+
+sample_stage = meta.set_index("sample").loc[ordered_samples, "stage"]
+
+# ============================================================
+# LOG TRANSFORM
+# ============================================================
+
+expr_log = np.log2(expr + 1)
+
+# ============================================================
+# ROBUST Z-SCORE (ROW-WISE)
+# ============================================================
+
+def robust_zscore(df):
+    z = df.sub(df.mean(axis=1), axis=0).div(df.std(axis=1, ddof=0), axis=0)
+    return z.clip(-2.5, 2.5)
+
+expr_z = robust_zscore(expr_log)
+
+# ============================================================
+# COLORS
+# ============================================================
+
+stage_colors = {
+    "F0": "#66c2a5",
+    "F1": "#8da0cb",
+    "F2": "#ffd92f",
+    "F3": "#fc8d62",
+    "F4": "#e41a1c"
+}
+
+col_colors = sample_stage.map(stage_colors).to_numpy()
+
+legend_handles = [
+    Patch(facecolor=stage_colors[s], label=s)
+    for s in stage_order
+]
+
+# ============================================================
+# INDIVIDUAL SAMPLE HEATMAP
+# ============================================================
+
+print("Generating individual heatmap...")
+
+g = sns.clustermap(
+    expr_z,
+    cmap="viridis",
+    vmin=-2.5,
+    vmax=2.5,
+
+    row_cluster=True,
+    col_cluster=False,
+
+    col_colors=col_colors,
+
+    xticklabels=False,
+    yticklabels=True,
+
+    figsize=(20, 11),
+
+    dendrogram_ratio=(0.12, 0.02),
+
+    cbar_pos=(0.02, 0.82, 0.02, 0.18),
+
+    linewidths=0,
+    tree_kws={"linewidths": 0.8}
+)
+
+g.ax_heatmap.set_ylabel("Genes")
+
+cbar = g.ax_heatmap.collections[0].colorbar
+cbar.set_label("Gene Z-score (log2 TPM)", rotation=90, labelpad=12)
+cbar.set_ticks([-2.5, 0, 2.5])
+
+g.ax_heatmap.legend(
+    handles=legend_handles,
+    title="Fibrosis stage",
+    bbox_to_anchor=(1.25, 1),
+    loc="upper left",
+    frameon=False
+)
+
+plt.savefig(
+    "GSE135251_individual_heatmap_publication_v2.pdf",
+    bbox_inches="tight"
+)
+
+plt.savefig(
+    "GSE135251_individual_heatmap_publication_v2.tiff",
+    dpi=600,
+    pil_kwargs={"compression": "tiff_lzw"},
+    bbox_inches="tight"
+)
+
+plt.close()
+
+# ============================================================
+# STAGE AVERAGED HEATMAP
+# ============================================================
+
+print("Generating stage-average heatmap...")
+
+stage_means = pd.DataFrame(index=expr_log.index)
+
+for stage in stage_order:
+    samples = sample_stage[sample_stage == stage].index
+    stage_means[stage] = expr_log[samples].mean(axis=1)
+
+stage_z = robust_zscore(stage_means)
+
+g2 = sns.clustermap(
+    stage_z,
+    cmap="viridis",
+    vmin=-2.5,
+    vmax=2.5,
+
+    row_cluster=True,
+    col_cluster=False,
+
+    linewidths=0.4,
+
+    figsize=(6.5, 10),
+
+    dendrogram_ratio=(0.15, 0.05),
+
+    cbar_pos=(0.02, 0.8, 0.03, 0.2),
+
+    tree_kws={"linewidths": 0.8}
+)
+
+g2.ax_heatmap.set_xlabel("Fibrosis stage")
+g2.ax_heatmap.set_ylabel("Genes")
+
+cbar2 = g2.ax_heatmap.collections[0].colorbar
+cbar2.set_label("Gene Z-score (log2 TPM)", rotation=90, labelpad=12)
+cbar2.set_ticks([-2.5, 0, 2.5])
+
+plt.savefig(
+    "GSE135251_stage_average_heatmap_publication_v2.pdf",
+    bbox_inches="tight"
+)
+
+plt.savefig(
+    "GSE135251_stage_average_heatmap_publication_v2.tiff",
+    dpi=600,
+    pil_kwargs={"compression": "tiff_lzw"},
+    bbox_inches="tight"
+)
+
+plt.close()
+
+print("\nDone!")
+print("Publication-ready heatmaps generated (v2, viridis-consistent).")
