@@ -1,0 +1,453 @@
+import pandas as pd
+
+########################################
+# INPUT FILES
+########################################
+
+gene_list_file = "gene_list.txt"
+refgene_file = "refGene.txt"
+
+########################################
+# LOAD GENE LIST
+########################################
+
+genes = pd.read_csv(
+    gene_list_file,
+    header=None
+)[0].tolist()
+
+########################################
+# LOAD RefSeq TABLE
+########################################
+
+cols = [
+"bin","name","chrom","strand",
+"txStart","txEnd",
+"cdsStart","cdsEnd",
+"exonCount",
+"exonStarts","exonEnds",
+"score",
+"name2",
+"cdsStartStat",
+"cdsEndStat",
+"exonFrames"
+]
+
+ref = pd.read_csv(
+    refgene_file,
+    sep="\t",
+    names=cols
+)
+
+########################################
+# FILTER TARGET GENES
+########################################
+
+ref = ref[
+    ref["name2"].isin(genes)
+]
+
+########################################
+# LONGEST TRANSCRIPT
+########################################
+
+ref["length"] = (
+    ref["txEnd"] - ref["txStart"]
+)
+
+ref = ref.sort_values(
+    "length",
+    ascending=False
+)
+
+ref = ref.drop_duplicates(
+    "name2"
+)
+
+########################################
+# BUILD GENE +500bp BED
+########################################
+
+gene_bed = []
+
+for idx, row in ref.iterrows():
+
+    chrom = row["chrom"]
+    strand = row["strand"]
+    gene = row["name2"]
+
+    txStart = int(row["txStart"])
+    txEnd = int(row["txEnd"])
+
+    if strand == "+":
+
+        start = txStart - 500
+        end = txEnd
+
+    else:
+
+        start = txStart
+        end = txEnd + 500
+
+    if start < 0:
+        start = 0
+
+    gene_bed.append([
+        chrom,
+        start,
+        end,
+        gene,
+        0,
+        strand
+    ])
+
+########################################
+# BUILD PROMOTER (-1000/+100)
+########################################
+
+promoter_bed = []
+
+for idx, row in ref.iterrows():
+
+    chrom = row["chrom"]
+    strand = row["strand"]
+    gene = row["name2"]
+
+    txStart = int(row["txStart"])
+    txEnd = int(row["txEnd"])
+
+    if strand == "+":
+
+        tss = txStart
+
+        start = tss - 1000
+        end = tss + 100
+
+    else:
+
+        tss = txEnd
+
+        start = tss - 100
+        end = tss + 1000
+
+    if start < 0:
+        start = 0
+
+    promoter_bed.append([
+        chrom,
+        start,
+        end,
+        gene,
+        0,
+        strand
+    ])
+
+########################################
+# SAVE OUTPUT FILES
+########################################
+
+pd.DataFrame(gene_bed).to_csv(
+"mm9_gene_plus500bp_CORRECT.bed",
+sep="\t",
+header=False,
+index=False
+)
+
+pd.DataFrame(promoter_bed).to_csv(
+"mm9_promoter_-1000_+100bp.bed",
+sep="\t",
+header=False,
+index=False
+)
+
+print("BED files created successfully!")
+
+import pyBigWig
+import pandas as pd
+import numpy as np
+import pysam
+import re
+import os
+
+########################################
+# INPUT FILES
+########################################
+
+promoter_bed_file = "mm9_promoter_-1000_+100bp.bed"
+gene_bed_file = "mm9_gene_plus500bp_CORRECT.bed"
+
+fasta_file = "mm9.fa"
+
+bigwig_files = [
+"Normal_chow_TFE3_ChIP-seq_Control_1_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_Control_2_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_Control_3_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_Control_4_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_LiFKO_1_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_LiFKO_2_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_LiFKO_3_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_LiFKO_4_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_Tfe3KO_1_ChIP_inputnormalized.bw",
+"Normal_chow_TFE3_ChIP-seq_Tfe3KO_2_ChIP_inputnormalized.bw"
+]
+
+########################################
+# GROUP BIGWIGS AUTOMATICALLY
+########################################
+
+groups = {
+"Control": [],
+"LiFKO": [],
+"Tfe3KO": []
+}
+
+for bw in bigwig_files:
+
+    if "Control" in bw:
+        groups["Control"].append(bw)
+
+    elif "LiFKO" in bw:
+        groups["LiFKO"].append(bw)
+
+    elif "Tfe3KO" in bw:
+        groups["Tfe3KO"].append(bw)
+
+########################################
+# LOAD BED FILES
+########################################
+
+promoter_bed = pd.read_csv(
+    promoter_bed_file,
+    sep="\t",
+    header=None,
+    names=["chr","start","end","gene","score","strand"]
+)
+
+gene_bed = pd.read_csv(
+    gene_bed_file,
+    sep="\t",
+    header=None,
+    names=["chr","start","end","gene","score","strand"]
+)
+
+########################################
+# FASTA
+########################################
+
+fasta = pysam.FastaFile(fasta_file)
+
+########################################
+# MOTIFS
+########################################
+
+ebox_pattern = re.compile("CA..TG")
+clear_pattern = re.compile("GTCACGTGAC")
+
+motif_bed_lines = []
+
+########################################
+# AUC FUNCTION
+########################################
+
+def compute_auc(bw, chrom, start, end):
+
+    intervals = bw.intervals(
+        chrom,
+        start,
+        end
+    )
+
+    if intervals is None:
+        return 0
+
+    auc = 0
+
+    for s, e, val in intervals:
+
+        overlap_start = max(s, start)
+        overlap_end = min(e, end)
+
+        length = overlap_end - overlap_start
+
+        auc += length * val
+
+    return auc
+
+########################################
+# MAIN ANALYSIS
+########################################
+
+results = []
+
+for idx in range(len(promoter_bed)):
+
+    gene = promoter_bed.loc[idx,"gene"]
+
+    p_chr = promoter_bed.loc[idx,"chr"]
+    p_start = int(promoter_bed.loc[idx,"start"])
+    p_end = int(promoter_bed.loc[idx,"end"])
+
+    g_chr = gene_bed.loc[idx,"chr"]
+    g_start = int(gene_bed.loc[idx,"start"])
+    g_end = int(gene_bed.loc[idx,"end"])
+
+    row_dict = {"Gene": gene}
+
+    ####################################
+    # PROMOTER AUC — INDIVIDUAL
+    ####################################
+
+    for condition in groups:
+
+        auc_values = []
+
+        for bw_file in groups[condition]:
+
+            bw = pyBigWig.open(bw_file)
+
+            auc = compute_auc(
+                bw,
+                p_chr,
+                p_start,
+                p_end
+            )
+
+            bw.close()
+
+            auc_values.append(auc)
+
+            sample_name = os.path.basename(
+                bw_file
+            ).replace(".bw","")
+
+            row_dict[
+                f"{sample_name}_PROMOTER"
+            ] = auc
+
+        row_dict[
+            f"{condition}_PROMOTER_MEAN"
+        ] = np.mean(auc_values)
+
+    ####################################
+    # GENE AUC — INDIVIDUAL
+    ####################################
+
+    for condition in groups:
+
+        auc_values = []
+
+        for bw_file in groups[condition]:
+
+            bw = pyBigWig.open(bw_file)
+
+            auc = compute_auc(
+                bw,
+                g_chr,
+                g_start,
+                g_end
+            )
+
+            bw.close()
+
+            auc_values.append(auc)
+
+            sample_name = os.path.basename(
+                bw_file
+            ).replace(".bw","")
+
+            row_dict[
+                f"{sample_name}_GENE"
+            ] = auc
+
+        row_dict[
+            f"{condition}_GENE_MEAN"
+        ] = np.mean(auc_values)
+
+    ####################################
+    # PROMOTER MOTIFS
+    ####################################
+
+    promoter_seq = fasta.fetch(
+        p_chr,
+        p_start,
+        p_end
+    ).upper()
+
+    promoter_ebox = len(
+        list(
+            ebox_pattern.finditer(promoter_seq)
+        )
+    )
+
+    promoter_clear = len(
+        list(
+            clear_pattern.finditer(promoter_seq)
+        )
+    )
+
+    ####################################
+    # GENE MOTIFS
+    ####################################
+
+    gene_seq = fasta.fetch(
+        g_chr,
+        g_start,
+        g_end
+    ).upper()
+
+    gene_ebox = len(
+        list(
+            ebox_pattern.finditer(gene_seq)
+        )
+    )
+
+    gene_clear = len(
+        list(
+            clear_pattern.finditer(gene_seq)
+        )
+    )
+
+    ####################################
+    # SAVE COUNTS
+    ####################################
+
+    row_dict["Promoter_Ebox_count"] = promoter_ebox
+    row_dict["Promoter_CLEAR_count"] = promoter_clear
+    row_dict["Gene_Ebox_count"] = gene_ebox
+    row_dict["Gene_CLEAR_count"] = gene_clear
+
+    results.append(row_dict)
+
+########################################
+# SAVE TABLE
+########################################
+
+df = pd.DataFrame(results)
+
+df.to_csv(
+"Gene_AUC_Promoter_Gene_IndividualSamples.csv",
+index=False
+)
+
+########################################
+# SAVE IGV MOTIF TRACK
+########################################
+
+with open(
+"Motifs_Ebox_BLUE_CLEAR_RED_IGV.bed",
+"w"
+) as out:
+
+    out.write(
+    'track name="Motifs" itemRgb="On"\n'
+    )
+
+    for line in motif_bed_lines:
+
+        out.write(
+            "\t".join(
+                map(str,line)
+            ) + "\n"
+        )
+
+print("Script finished successfully!")
