@@ -1,0 +1,114 @@
+# =========================================================
+# GSE269493 FULL RNA-seq PIPELINE (CORRECTED)
+# counts → VST → gene symbols → TRUE GSM labels
+# =========================================================
+
+# -----------------------------
+# 1. Setup
+# -----------------------------
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("DESeq2", "GEOquery", "org.Mm.eg.db"),
+                     ask = FALSE, update = FALSE)
+
+library(DESeq2)
+library(GEOquery)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+
+# -----------------------------
+# 2. Load counts matrix
+# -----------------------------
+counts <- read.table(
+  "GSE269493_CDAA_progression_counts.txt.gz",
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE
+)
+
+# -----------------------------
+# 3. DESeq2 object
+# -----------------------------
+coldata <- data.frame(
+  row.names = colnames(counts),
+  condition = factor(rep("group", ncol(counts)))
+)
+
+dds <- DESeqDataSetFromMatrix(counts, coldata, ~1)
+
+# filter low-expression genes
+dds <- dds[rowSums(counts(dds)) > 10, ]
+
+# -----------------------------
+# 4. VST normalization
+# -----------------------------
+vsd <- vst(dds, blind = TRUE)
+mat <- assay(vsd)
+
+# -----------------------------
+# 5. Clean Ensembl IDs
+# -----------------------------
+rownames(mat) <- gsub("\\..*", "", rownames(mat))
+
+# -----------------------------
+# 6. Map Ensembl → gene symbols
+# -----------------------------
+symbols <- mapIds(
+  org.Mm.eg.db,
+  keys = rownames(mat),
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+keep <- !is.na(symbols)
+
+mat <- mat[keep, ]
+symbols <- symbols[keep]
+
+rownames(mat) <- symbols
+
+# -----------------------------
+# 7. Load GEO metadata
+# -----------------------------
+gse <- getGEO("GSE269493", GSEMatrix = TRUE)
+meta <- pData(gse[[1]])
+
+# real GSM IDs and sample names
+gsm_ids <- meta$geo_accession
+geo_titles <- meta$title
+
+# -----------------------------
+# 8. SAFE sample alignment
+# -----------------------------
+# Try matching GEO titles to matrix column names
+match_idx <- match(geo_titles, colnames(mat))
+
+# Check if matching worked
+if (any(is.na(match_idx))) {
+  stop("Sample matching failed — GEO titles do not match matrix columns.")
+}
+
+# reorder matrix
+mat <- mat[, match_idx]
+
+# assign TRUE GSM IDs
+colnames(mat) <- gsm_ids
+
+# -----------------------------
+# 9. Save final matrix
+# -----------------------------
+write.table(
+  mat,
+  file = "GSE269493_VST_geneSymbols_GSM.tsv",
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+cat("DONE: final corrected matrix saved\n")
